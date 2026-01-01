@@ -1,0 +1,230 @@
+name: RBAC Drift Detection
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Run daily at 6 AM UTC
+  workflow_dispatch:      # Allow manual trigger
+    inputs:
+      subscription:
+        description: 'Specific subscription folder to check (leave empty for all)'
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+jobs:
+  discover-subscriptions:
+    name: Discover Subscriptions
+    runs-on: ubuntu-latest
+    outputs:
+      subscriptions: ${{ steps.discover.outputs.subscriptions }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Discover subscription folders
+        id: discover
+        run: |
+          if [ -n "${{ inputs.subscription }}" ]; then
+            # Manual trigger with specific subscription
+            SUBS='["${{ inputs.subscription }}"]'
+          else
+            # Discover all subscription folders
+            SUBS=$(ls -d subscriptions/*/ 2>/dev/null | xargs -I {} basename {} | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          fi
+          
+          echo "subscriptions=$SUBS" >> $GITHUB_OUTPUT
+          echo "Subscriptions to check: $SUBS"
+
+  drift-detection:
+    name: Drift - ${{ matrix.subscription }}
+    needs: discover-subscriptions
+    if: needs.discover-subscriptions.outputs.subscriptions != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        subscription: ${{ fromJson(needs.discover-subscriptions.outputs.subscriptions) }}
+    
+    env:
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: true
+
+    outputs:
+      drift_found: ${{ steps.drift.outputs.drift_found }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: subscriptions/${{ matrix.subscription }}
+        run: terraform init
+
+      - name: Run Drift Detection
+        id: drift
+        working-directory: subscriptions/${{ matrix.subscription }}
+        shell: pwsh
+        run: |
+          $subscriptionName = "${{ matrix.subscription }}"
+
+          # Read subscription ID from main.tf (not from env - that's the state storage subscription)
+          $mainTf = Get-Content -Path "main.tf" -Raw
+          if ($mainTf -match 'subscription_id\s*=\s*"([^"]+)"') {
+            $subscriptionId = $matches[1]
+          }
+          else {
+            throw "Could not find subscription_id in main.tf"
+          }
+          Write-Host "Checking subscription: $subscriptionId"
+
+          az account set -s $subscriptionId
+          if ($LASTEXITCODE -ne 0) { throw "Failed to set subscription" }
+
+          $roleassignments = az role assignment list --all | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Failed to list role assignments" }
+          $roleassignments = $roleassignments | Where-Object { $_.scope.ToLower().Contains($subscriptionId.ToLower()) }
+
+          $state = terraform state pull | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Failed to pull terraform state" }
+
+          $stateIds = @(($state.resources | Where-Object { $_.type -eq "azurerm_role_assignment" }).instances.attributes.id) | 
+              ForEach-Object { $_.ToLower() }
+
+          $driftedRoles = $roleassignments | Where-Object { $_.id.ToLower() -notin $stateIds }
+
+          if ($driftedRoles.Count -gt 0) {
+            Write-Output "drift_found=true" >> $env:GITHUB_OUTPUT
+            
+            # Build markdown table
+            $mdTable = @()
+            $mdTable += "| Principal Name | Principal ID | Role Name | Role Definition ID | Assignment ID | Scope |"
+            $mdTable += "|----------------|--------------|-----------|-------------------|---------------|-------|"
+            
+            foreach ($role in $driftedRoles) {
+              $principalName = if ($role.principalName) { $role.principalName } else { "N/A" }
+              $principalId = $role.principalId
+              $roleName = $role.roleDefinitionName
+              $roleDefId = ($role.roleDefinitionId -split '/')[-1]
+              $assignmentId = ($role.id -split '/')[-1]
+              $scope = $role.scope
+              
+              $mdTable += "| $principalName | ``$principalId`` | $roleName | ``$roleDefId`` | ``$assignmentId`` | ``$scope`` |"
+            }
+            
+            $mdTable -join "`n" | Set-Content -Path drift_report.md
+            
+            Write-Output "::warning::[$subscriptionName] RBAC Drift detected! $($driftedRoles.Count) role(s) not in Terraform state."
+            $driftedRoles | Select-Object principalName, principalId, roleDefinitionName, id, scope | Format-Table -AutoSize
+          } else {
+            Write-Output "drift_found=false" >> $env:GITHUB_OUTPUT
+            Write-Output "[$subscriptionName] No RBAC drift detected."
+          }
+
+      - name: Upload Drift Report
+        if: steps.drift.outputs.drift_found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-report-${{ matrix.subscription }}
+          path: subscriptions/${{ matrix.subscription }}/drift_report.md
+          retention-days: 7
+
+  create-issue:
+    name: Create Drift Issue
+    needs: drift-detection
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all drift reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: drift-report-*
+          path: drift-reports
+          merge-multiple: false
+        continue-on-error: true
+
+      - name: Check for drift reports
+        id: check-drift
+        run: |
+          if [ -d "drift-reports" ] && [ "$(ls -A drift-reports 2>/dev/null)" ]; then
+            echo "has_drift=true" >> $GITHUB_OUTPUT
+            echo "Found drift reports"
+          else
+            echo "has_drift=false" >> $GITHUB_OUTPUT
+            echo "No drift reports found"
+          fi
+
+      - name: Create GitHub Issue for Drift
+        if: steps.check-drift.outputs.has_drift == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const today = new Date().toISOString().split('T')[0];
+            
+            // Read all drift reports
+            const driftReportsDir = 'drift-reports';
+            let combinedReport = '';
+            
+            if (fs.existsSync(driftReportsDir)) {
+              const subDirs = fs.readdirSync(driftReportsDir);
+              
+              for (const subDir of subDirs) {
+                const subName = subDir.replace('drift-report-', '');
+                const reportPath = path.join(driftReportsDir, subDir, 'drift_report.md');
+                
+                if (fs.existsSync(reportPath)) {
+                  const report = fs.readFileSync(reportPath, 'utf8');
+                  combinedReport += `\n### 📁 Subscription: \`${subName}\`\n\n${report}\n`;
+                }
+              }
+            }
+            
+            if (!combinedReport) {
+              console.log('No drift reports to create issue for');
+              return;
+            }
+
+            const body = `## ⚠️ RBAC Drift Detected
+
+            The following role assignments exist in Azure but are not managed by Terraform:
+
+            ${combinedReport}
+
+            ### Action Required
+            Please review and either:
+            1. Import these role assignments into Terraform using the \`map.ps1\` script
+            2. Remove them from Azure if they are no longer needed
+
+            ---
+            **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `⚠️ RBAC Drift Detected - ${today}`,
+              body: body,
+              labels: ['drift', 'rbac', 'terraform']
+            });

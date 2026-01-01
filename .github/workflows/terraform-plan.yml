@@ -1,0 +1,139 @@
+name: Terraform Plan
+
+on:
+  pull_request:
+    paths:
+      - 'subscriptions/**/*.tf'
+      - 'subscriptions/**/*.tfvars'
+      - 'subscriptions/**/*.tfvars.json'
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write  # Required for OIDC authentication
+
+jobs:
+  detect-changes:
+    name: Detect Changed Subscriptions
+    runs-on: ubuntu-latest
+    outputs:
+      subscriptions: ${{ steps.detect.outputs.subscriptions }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed subscriptions
+        id: detect
+        run: |
+          # Get list of changed subscription folders (any .tf or .tfvars files)
+          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | \
+            grep -E 'subscriptions/[^/]+/.*\.(tf|tfvars|tfvars\.json)$' | \
+            sed 's|subscriptions/\([^/]*\)/.*|\1|' | \
+            sort -u | \
+            jq -R -s -c 'split("\n") | map(select(length > 0))')
+          
+          echo "subscriptions=$CHANGED" >> $GITHUB_OUTPUT
+          
+          if [ "$CHANGED" = "[]" ] || [ -z "$CHANGED" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No subscription changes detected"
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "Changed subscriptions: $CHANGED"
+          fi
+
+  terraform-plan:
+    name: Plan - ${{ matrix.subscription }}
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        subscription: ${{ fromJson(needs.detect-changes.outputs.subscriptions) }}
+    
+    env:
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+      - name: Terraform Format Check
+        working-directory: subscriptions/${{ matrix.subscription }}
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        working-directory: subscriptions/${{ matrix.subscription }}
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: subscriptions/${{ matrix.subscription }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: subscriptions/${{ matrix.subscription }}
+        run: |
+          terraform plan -out=tfplan
+          terraform show -no-color tfplan > tfplan.txt
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.subscription }}-${{ github.event.pull_request.number }}
+          path: |
+            subscriptions/${{ matrix.subscription }}/tfplan
+            subscriptions/${{ matrix.subscription }}/tfplan.txt
+          retention-days: 30
+
+      - name: Comment Plan on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('subscriptions/${{ matrix.subscription }}/tfplan.txt', 'utf8');
+            const maxLength = 65000;
+            const truncatedPlan = plan.length > maxLength 
+              ? plan.substring(0, maxLength) + '\n\n... (truncated)'
+              : plan;
+            
+            const output = `## Terraform Plan - \`${{ matrix.subscription }}\` 📋
+            
+            <details>
+            <summary>Show Plan</summary>
+            
+            \`\`\`hcl
+            ${truncatedPlan}
+            \`\`\`
+            
+            </details>
+            
+            *Triggered by @${{ github.actor }} on \`${{ github.event.pull_request.head.ref }}\`*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });

@@ -1,0 +1,187 @@
+name: Terraform Apply
+
+on:
+  push:
+    paths:
+      - 'subscriptions/**/*.tf'
+      - 'subscriptions/**/*.tfvars'
+      - 'subscriptions/**/*.tfvars.json'
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write        # Required for OIDC authentication
+  actions: read          # Required to download artifacts from other workflow runs
+  pull-requests: read    # Required to get PR number from merge commit
+
+jobs:
+  detect-changes:
+    name: Detect Changed Subscriptions
+    runs-on: ubuntu-latest
+    outputs:
+      subscriptions: ${{ steps.detect.outputs.subscriptions }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed subscriptions
+        id: detect
+        run: |
+          # Get list of changed subscription folders from the merge commit
+          CHANGED=$(git diff --name-only HEAD~1 HEAD | \
+            grep -E 'subscriptions/[^/]+/.*\.(tf|tfvars|tfvars\.json)$' | \
+            sed 's|subscriptions/\([^/]*\)/.*|\1|' | \
+            sort -u | \
+            jq -R -s -c 'split("\n") | map(select(length > 0))')
+          
+          echo "subscriptions=$CHANGED" >> $GITHUB_OUTPUT
+          
+          if [ "$CHANGED" = "[]" ] || [ -z "$CHANGED" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No subscription changes detected"
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "Changed subscriptions: $CHANGED"
+          fi
+
+  terraform-apply:
+    name: Apply - ${{ matrix.subscription }}
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1  # Apply one at a time for safety
+      matrix:
+        subscription: ${{ fromJson(needs.detect-changes.outputs.subscriptions) }}
+    
+    env:
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Get PR Number from Merge Commit
+        id: get-pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const commits = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha
+            });
+            
+            if (commits.data.length > 0) {
+              const prNumber = commits.data[0].number;
+              core.setOutput('pr_number', prNumber);
+              console.log(`Found PR #${prNumber}`);
+            } else {
+              console.log('No associated PR found, will run fresh plan');
+              core.setOutput('pr_number', '');
+            }
+
+      - name: Find Plan Artifact from PR Workflow
+        id: find-artifact
+        if: steps.get-pr.outputs.pr_number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifactName = `tfplan-${{ matrix.subscription }}-${{ steps.get-pr.outputs.pr_number }}`;
+            
+            // List artifacts from this repo
+            const artifacts = await github.rest.actions.listArtifactsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            });
+            
+            const artifact = artifacts.data.artifacts.find(a => a.name === artifactName && !a.expired);
+            
+            if (artifact) {
+              core.setOutput('artifact_id', artifact.id);
+              core.setOutput('run_id', artifact.workflow_run.id);
+              core.setOutput('found', 'true');
+              console.log(`Found artifact: ${artifactName} (ID: ${artifact.id}, Run ID: ${artifact.workflow_run.id})`);
+            } else {
+              core.setOutput('found', 'false');
+              console.log(`Artifact not found: ${artifactName}`);
+            }
+
+      - name: Download Plan Artifact
+        if: steps.find-artifact.outputs.found == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ matrix.subscription }}-${{ steps.get-pr.outputs.pr_number }}
+          path: downloaded-plan
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.find-artifact.outputs.run_id }}
+        id: download-artifact
+
+      - name: Verify Plan File
+        if: steps.find-artifact.outputs.found == 'true'
+        run: |
+          echo "📂 Checking for plan file..."
+          echo "=== Downloaded artifact contents ==="
+          find downloaded-plan -type f
+          
+          # Find and copy tfplan to the correct location
+          TFPLAN_FILE=$(find downloaded-plan -name "tfplan" -type f | head -1)
+          if [ -n "$TFPLAN_FILE" ]; then
+            echo "Found plan at: $TFPLAN_FILE"
+            cp "$TFPLAN_FILE" subscriptions/${{ matrix.subscription }}/tfplan
+            echo "✅ Plan file copied to subscriptions/${{ matrix.subscription }}/tfplan"
+          else
+            echo "❌ Plan file not found in artifact!"
+            exit 1
+          fi
+          
+          # Also copy tfplan.txt if it exists
+          TFPLAN_TXT=$(find downloaded-plan -name "tfplan.txt" -type f | head -1)
+          if [ -n "$TFPLAN_TXT" ]; then
+            cp "$TFPLAN_TXT" subscriptions/${{ matrix.subscription }}/tfplan.txt
+          fi
+          
+          echo "=== Final directory listing ==="
+          ls -la subscriptions/${{ matrix.subscription }}/
+
+      - name: Fail if artifact not found
+        if: steps.find-artifact.outputs.found != 'true'
+        run: |
+          echo "❌ Plan artifact not found for PR #${{ steps.get-pr.outputs.pr_number }}"
+          echo "Make sure the terraform-plan workflow completed successfully before merging."
+          exit 1
+
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        working-directory: subscriptions/${{ matrix.subscription }}
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: subscriptions/${{ matrix.subscription }}
+        run: |
+          echo "📦 Applying saved plan from PR #${{ steps.get-pr.outputs.pr_number }}"
+          echo "=== Plan contents before apply ==="
+          terraform show tfplan
+          echo ""
+          echo "=== Applying ==="
+          terraform apply -auto-approve tfplan
