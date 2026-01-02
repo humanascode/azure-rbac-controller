@@ -185,7 +185,6 @@ $app.AppId
 
 Go to your GitHub repository → **Settings** → **Secrets and variables** → **Actions** → **New repository secret** 3 times to add the above secrets.
 
-> **Recommendation:** Configure [branch rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets) to protect the `main` branch. This ensures that all changes go through pull requests with proper review and that the Terraform plan workflow runs before merging.
 
 ---
 
@@ -262,6 +261,8 @@ Now everything is ready to run plan and apply to import and manage role assignme
 2. The GitHub Actions workflow `terraform-plan.yml` triggers automatically
 3. Review the Terraform plan output in the PR checks
 4. You should only see `resources to import` and 0 for create, destroy, or change
+
+> **Recommendation:** Configure [branch rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets) to protect the `main` branch. This ensures that all changes go through pull requests with proper review and that the Terraform plan workflow runs before merging.
 
 #### Terraform Apply on Merge
 
