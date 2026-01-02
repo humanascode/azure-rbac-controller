@@ -38,7 +38,7 @@ This solution helps you:
 
 ## Setup Guide
 
-### Step 0: Fork this Repository
+### Step 0: Fork this Repository (Or download as ZIP)
 1. Go to this repository on GitHub.
 2. Click the "Fork" button in the top-right corner to create a copy in your own GitHub account.
 
