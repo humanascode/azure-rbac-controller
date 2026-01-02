@@ -29,7 +29,8 @@ This solution helps you:
 
 - **Azure PowerShell module** linked [here](https://learn.microsoft.com/en-us/powershell/azure/install-az-ps)
 - **Terraform** >= 1.6
-- **GitHub Runners** with PowerShell and Terraform installed (if using self-hosted runners)
+- **GitHub Runners** with PowerShell and Terraform installed (PowerShell is pre-configured on GitHub-hosted managed runners)
+- **GitHub organization** to host the repository
 - **GitHub repository** for storing the configuration
 - **Azure Storage Account** for Terraform state backend
 - **Azure CLI** if you are following the setup steps below
@@ -172,6 +173,8 @@ az account show --query tenantId -o tsv
 ```
 
 Go to your GitHub repository → **Settings** → **Secrets and variables** → **Actions** → **New repository secret** 3 times to add the above secrets.
+
+> **Recommendation:** Configure [branch rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets) to protect the `main` branch. This ensures that all changes go through pull requests with proper review and that the Terraform plan workflow runs before merging.
 
 ---
 
