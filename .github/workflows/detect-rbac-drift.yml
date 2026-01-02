@@ -80,63 +80,9 @@ jobs:
 
       - name: Run Drift Detection
         id: drift
-        working-directory: subscriptions/${{ matrix.subscription }}
         shell: pwsh
         run: |
-          $subscriptionName = "${{ matrix.subscription }}"
-
-          # Read subscription ID from main.tf (not from env - that's the state storage subscription)
-          $mainTf = Get-Content -Path "main.tf" -Raw
-          if ($mainTf -match 'subscription_id\s*=\s*"([^"]+)"') {
-            $subscriptionId = $matches[1]
-          }
-          else {
-            throw "Could not find subscription_id in main.tf"
-          }
-          Write-Host "Checking subscription: $subscriptionId"
-
-          az account set -s $subscriptionId
-          if ($LASTEXITCODE -ne 0) { throw "Failed to set subscription" }
-
-          $roleassignments = az role assignment list --all | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { throw "Failed to list role assignments" }
-          $roleassignments = $roleassignments | Where-Object { $_.scope.ToLower().Contains($subscriptionId.ToLower()) }
-
-          $state = terraform state pull | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { throw "Failed to pull terraform state" }
-
-          $stateIds = @(($state.resources | Where-Object { $_.type -eq "azurerm_role_assignment" }).instances.attributes.id) | 
-              ForEach-Object { $_.ToLower() }
-
-          $driftedRoles = $roleassignments | Where-Object { $_.id.ToLower() -notin $stateIds }
-
-          if ($driftedRoles.Count -gt 0) {
-            Write-Output "drift_found=true" >> $env:GITHUB_OUTPUT
-            
-            # Build markdown table
-            $mdTable = @()
-            $mdTable += "| Principal Name | Principal ID | Role Name | Role Definition ID | Assignment ID | Scope |"
-            $mdTable += "|----------------|--------------|-----------|-------------------|---------------|-------|"
-            
-            foreach ($role in $driftedRoles) {
-              $principalName = if ($role.principalName) { $role.principalName } else { "N/A" }
-              $principalId = $role.principalId
-              $roleName = $role.roleDefinitionName
-              $roleDefId = ($role.roleDefinitionId -split '/')[-1]
-              $assignmentId = ($role.id -split '/')[-1]
-              $scope = $role.scope
-              
-              $mdTable += "| $principalName | ``$principalId`` | $roleName | ``$roleDefId`` | ``$assignmentId`` | ``$scope`` |"
-            }
-            
-            $mdTable -join "`n" | Set-Content -Path drift_report.md
-            
-            Write-Output "::warning::[$subscriptionName] RBAC Drift detected! $($driftedRoles.Count) role(s) not in Terraform state."
-            $driftedRoles | Select-Object principalName, principalId, roleDefinitionName, id, scope | Format-Table -AutoSize
-          } else {
-            Write-Output "drift_found=false" >> $env:GITHUB_OUTPUT
-            Write-Output "[$subscriptionName] No RBAC drift detected."
-          }
+          ./drift_detect.ps1 -SubscriptionFolders "${{ matrix.subscription }}" -OutputMarkdown -CI
 
       - name: Upload Drift Report
         if: steps.drift.outputs.drift_found == 'true'

@@ -10,19 +10,36 @@
     One or more subscription folder names under ./subscriptions/ to check.
     If not specified, checks all subscription folders.
 
+.PARAMETER OutputMarkdown
+    If specified, outputs a markdown report file for each subscription with drift.
+    Used by GitHub Actions to generate issue content.
+
+.PARAMETER CI
+    If specified, sets GitHub Actions output variables and uses CI-friendly output.
+
 .EXAMPLE
     ./drift_detect.ps1
-    # Checks all subscriptions
+    # Checks all subscriptions locally
 
 .EXAMPLE
     ./drift_detect.ps1 -SubscriptionFolders "my_subscription_1", "my_subscription_2"
     # Checks specific subscriptions
+
+.EXAMPLE
+    ./drift_detect.ps1 -SubscriptionFolders "my_subscription" -OutputMarkdown -CI
+    # Runs in GitHub Actions mode with markdown output
 #>
 
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $false)]
-    [string[]]$SubscriptionFolders
+    [string[]]$SubscriptionFolders,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$OutputMarkdown,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$CI
 )
 
 $subscriptionsPath = Join-Path -Path $PSScriptRoot -ChildPath "subscriptions"
@@ -111,6 +128,26 @@ foreach ($folder in $SubscriptionFolders) {
                     AssignmentId       = $role.id
                 }
             }
+
+            # Generate markdown report if requested
+            if ($OutputMarkdown) {
+                $mdTable = @()
+                $mdTable += "| Principal Name | Principal ID | Role Name | Role Definition ID | Assignment ID | Scope |"
+                $mdTable += "|----------------|--------------|-----------|-------------------|---------------|-------|"
+                
+                foreach ($role in $driftedRoles) {
+                    $principalName = if ($role.principalName) { $role.principalName } else { "N/A" }
+                    $principalId = $role.principalId
+                    $roleName = $role.roleDefinitionName
+                    $roleDefId = ($role.roleDefinitionId -split '/')[-1]
+                    $assignmentId = ($role.id -split '/')[-1]
+                    $scope = $role.scope
+                    
+                    $mdTable += "| $principalName | ``$principalId`` | $roleName | ``$roleDefId`` | ``$assignmentId`` | ``$scope`` |"
+                }
+                
+                $mdTable -join "`n" | Set-Content -Path (Join-Path $folderPath "drift_report.md")
+            }
         }
         else {
             Write-Host "   ✅ No drift detected" -ForegroundColor Green
@@ -135,13 +172,25 @@ if ($allDrift.Count -gt 0) {
         $_.Group | Format-Table -Property PrincipalName, RoleDefinitionName, Scope -AutoSize
     }
     
-    # Export to CSV
-    $csvPath = Join-Path -Path $PSScriptRoot -ChildPath "drift_report.csv"
-    $allDrift | Export-Csv -Path $csvPath -NoTypeInformation
-    Write-Host "📄 Full report exported to: drift_report.csv" -ForegroundColor Cyan
+    # Export to CSV (local runs)
+    if (-not $CI) {
+        $csvPath = Join-Path -Path $PSScriptRoot -ChildPath "drift_report.csv"
+        $allDrift | Export-Csv -Path $csvPath -NoTypeInformation
+        Write-Host "📄 Full report exported to: drift_report.csv" -ForegroundColor Cyan
+    }
+
+    # Set GitHub Actions output
+    if ($CI) {
+        Write-Output "drift_found=true" >> $env:GITHUB_OUTPUT
+        Write-Output "::warning::RBAC Drift detected! $($allDrift.Count) role(s) not in Terraform state."
+    }
 }
 else {
     Write-Host "✅ No drift detected across all subscriptions!" -ForegroundColor Green
+    
+    if ($CI) {
+        Write-Output "drift_found=false" >> $env:GITHUB_OUTPUT
+    }
 }
 
 Write-Host ""
