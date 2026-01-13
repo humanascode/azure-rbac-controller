@@ -62,12 +62,34 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install Az PowerShell Module
+        shell: pwsh
+        run: |
+          if (-not (Get-Module -ListAvailable -Name Az.Accounts)) {
+            Install-Module -Name Az.Accounts -Force -AllowClobber -Scope CurrentUser
+          }
+          if (-not (Get-Module -ListAvailable -Name Az.Resources)) {
+            Install-Module -Name Az.Resources -Force -AllowClobber -Scope CurrentUser
+          }
+
       - name: Azure Login via OIDC
         uses: azure/login@v2
         with:
           client-id: ${{ env.ARM_CLIENT_ID }}
           tenant-id: ${{ env.ARM_TENANT_ID }}
           subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+          enable-AzPSSession: true
+
+      - name: Verify Az PowerShell Connection
+        shell: pwsh
+        run: |
+          $context = Get-AzContext
+          if (-not $context) {
+            Write-Error "Az PowerShell session not authenticated"
+            exit 1
+          }
+          Write-Host "Connected to Azure as: $($context.Account.Id)"
+          Write-Host "Subscription: $($context.Subscription.Name)"
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3

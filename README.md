@@ -8,6 +8,8 @@ This solution helps you:
 
 - **Export existing RBAC role assignments** from Azure subscriptions into Terraform configuration
 - **Manage role assignments with Infrastructure as Code** with version control and pull request reviews
+- **Support for ABAC conditions** - role assignments with conditions are fully supported
+- **Exclude time-based (PIM) assignments** - JIT access assignments are automatically excluded
 - **Detect configuration drift** automatically via scheduled GitHub Actions workflows
 - **Apply changes safely** with plan-on-PR and apply-on-merge workflows
 
@@ -239,8 +241,10 @@ subscriptions/
 │   ├── main.tf              # Terraform configuration with RBAC module
 │   ├── backend.tf           # Azure backend configuration
 │   ├── import.tf            # Import blocks for existing role assignments
-│   └── terraform.tfvars.json # Role assignment data
+│   └── terraform.tfvars.json # Role assignment data (including conditions if present)
 ```
+
+> **Note:** The mapper script automatically excludes time-based (PIM/JIT) role assignments that have an expiration date. Only permanent role assignments are imported into Terraform.
 
 Now everything is ready to run plan and apply to import and manage role assignments (steps continued in the next section).
 
@@ -285,6 +289,13 @@ Now that the role assignments are imported into Terraform, you can manage them v
          "roleDefinitionName": "Reader",
          "scope": "/subscriptions/<sub-id>/resourceGroups/<rg-name>",
          "principalId": "<user-or-group-object-id>"
+       },
+       "2": {
+         "roleDefinitionName": "Storage Blob Data Reader",
+         "scope": "/subscriptions/<sub-id>",
+         "principalId": "<user-or-group-object-id>",
+         "condition": "@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals 'my-container'",
+         "conditionVersion": "2.0"
        }
      }
    }
@@ -298,12 +309,35 @@ Now that the role assignments are imported into Terraform, you can manage them v
 
 ## Drift Detection
 
-A scheduled workflow runs daily to detect configuration drift. Configuration drift occurs when role assignments are changed outside of Terraform (e.g., manually in the Azure portal). To keep control over your role assignments, the drift detection workflow runs daily and creates an issue if any drift is detected. specifically, the workflow:
-1. Runs a powershell script that:
-   - Scans the specified subscriptions for current role assignments
+A scheduled workflow runs daily to detect configuration drift. Configuration drift occurs when role assignments are changed outside of Terraform (e.g., manually in the Azure portal). To keep control over your role assignments, the drift detection workflow runs daily and creates an issue if any drift is detected.
+
+### What is Detected
+
+The drift detection identifies two types of drift:
+
+| Drift Type | Description |
+|------------|-------------|
+| **Missing** | Role assignments that exist in Azure but are not managed by Terraform |
+| **ConditionMismatch** | Role assignments where the ABAC condition or condition version differs between Azure and Terraform |
+
+> **Note:** Time-based (PIM/JIT) role assignments with an expiration date are automatically excluded from drift detection.
+
+### How It Works
+
+1. Runs a PowerShell script that:
+   - Scans the specified subscriptions for current role assignments (using Az PowerShell module)
+   - Excludes time-based PIM assignments that have an expiration date
    - Compares the current state with the desired state defined in the Terraform configuration
-   - If differences are found, it reports them
-2. Creates an issue if drift is detected and posts the details of the drift in the issue body
+   - Compares both role assignment existence AND ABAC conditions
+   - If differences are found, generates a detailed report
+2. Creates an issue if drift is detected with:
+   - A summary table showing all drifted role assignments
+   - Drift type (Missing or ConditionMismatch)
+   - Condition details if applicable
+   - **Remediation instructions** for missing role assignments including:
+     - Ready-to-use import blocks for `import.tf`
+     - JSON entries for `terraform.tfvars.json`
+     - Git commit and PR instructions
 
 ![Drift detection](images/drift.jpg)
 
